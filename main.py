@@ -1,4 +1,3 @@
-
 import json
 
 from dotenv import load_dotenv
@@ -17,13 +16,14 @@ from decision_engine import (
 )
 from security import verify_receipt, valid_call_id
 
-
 app = FastAPI(
     title="Safe AI Mailroom Agent",
     version="1.0.0",
 )
 
-MAX_BODY = 2 * 1024 * 1024
+# The assignment rejects successful request bodies larger than 512 KiB.
+# Enforce this while streaming, rather than reading an unbounded body first.
+MAX_BODY = 512 * 1024
 MAX_RESPONSE = 512 * 1024
 
 
@@ -34,10 +34,28 @@ def health():
 
 @app.post("/v1/mailroom/actions")
 async def mailroom_actions(request: Request):
-    raw = await request.body()
+    chunks = []
+    total_size = 0
 
-    if len(raw) > MAX_BODY:
-        raise HTTPException(413, "Request body too large")
+    # Content-Length is only an early-rejection optimization.
+    # The streaming count below remains authoritative.
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_BODY:
+                raise HTTPException(413, "Request body too large")
+        except ValueError:
+            raise HTTPException(400, "Invalid Content-Length header")
+
+    async for chunk in request.stream():
+        total_size += len(chunk)
+
+        if total_size > MAX_BODY:
+            raise HTTPException(413, "Request body too large")
+
+        chunks.append(chunk)
+
+    raw = b"".join(chunks)
 
     try:
         data = json.loads(raw)
@@ -71,8 +89,6 @@ async def mailroom_actions(request: Request):
 
 
 async def handle_propose(req: ProposeRequest):
-
-    # Convert dossiers into ordinary JSON-compatible dictionaries.
     dossiers = [
         d.model_dump(mode="json")
         for d in req.dossiers
@@ -92,14 +108,12 @@ async def handle_propose(req: ProposeRequest):
     # First database check: look for an existing evaluation
     # and retrieve previously cached decisions.
     with get_session() as db:
-
         existing = db.get(
             Evaluation,
             req.evaluationId
         )
 
         if existing:
-
             if (
                 existing.input_digest != input_digest
                 or existing.propose_request_digest
@@ -123,7 +137,6 @@ async def handle_propose(req: ProposeRequest):
         missing = []
 
         for d in dossiers:
-
             row = db.get(
                 DecisionCache,
                 fingerprints[d["dossierId"]]
@@ -138,7 +151,6 @@ async def handle_propose(req: ProposeRequest):
 
     # Run the decision engine only for dossiers that are not cached.
     if missing:
-
         try:
             model_items = await decide_dossiers(missing)
 
@@ -162,16 +174,13 @@ async def handle_propose(req: ProposeRequest):
                 )
 
             for d in missing:
-
                 item = validate_model_proposal(
                     by_id[d["dossierId"]],
                     d
                 )
-
                 cached[d["dossierId"]] = item
 
         except Exception as exc:
-
             print(
                 f"DECISION ENGINE ERROR: "
                 f"{type(exc).__name__}: {exc}"
@@ -186,7 +195,6 @@ async def handle_propose(req: ProposeRequest):
     proposals = []
 
     for d in dossiers:
-
         fingerprint = fingerprints[d["dossierId"]]
         item = cached[d["dossierId"]]
 
@@ -229,14 +237,12 @@ async def handle_propose(req: ProposeRequest):
     # Second database check and transaction:
     # persist the proposals, cache entries and evaluation.
     with get_session() as db:
-
         existing = db.get(
             Evaluation,
             req.evaluationId
         )
 
         if existing:
-
             if (
                 existing.input_digest != input_digest
                 or existing.propose_request_digest
@@ -252,11 +258,9 @@ async def handle_propose(req: ProposeRequest):
             )
 
         for d in dossiers:
-
             fingerprint = fingerprints[d["dossierId"]]
 
             if not db.get(DecisionCache, fingerprint):
-
                 proposal = next(
                     p for p in proposals
                     if p["dossierId"] == d["dossierId"]
@@ -297,9 +301,7 @@ async def handle_propose(req: ProposeRequest):
 
 
 def handle_commit(req: CommitRequest):
-
     with get_session() as db:
-
         # Find the original evaluation.
         evaluation = db.get(
             Evaluation,
@@ -325,7 +327,6 @@ def handle_commit(req: CommitRequest):
 
         # Exact replay returns the previously stored response.
         if evaluation.commit_response:
-
             if (
                 evaluation.commit_request_digest
                 != commit_request_digest
@@ -371,7 +372,6 @@ def handle_commit(req: CommitRequest):
 
         # Verify every receipt before recording any outcome.
         for receipt_model in req.receipts:
-
             receipt = receipt_model.model_dump(
                 mode="json"
             )
@@ -396,9 +396,7 @@ def handle_commit(req: CommitRequest):
                 receipt["receiptId"]
             )
 
-            expected_digest = proposal_digest(
-                proposal
-            )
+            expected_digest = proposal_digest(proposal)
 
             if (
                 receipt["callId"] != proposal["callId"]
@@ -452,7 +450,6 @@ def handle_commit(req: CommitRequest):
 
         # Store all verified receipts.
         for receipt_model in req.receipts:
-
             receipt_data = receipt_model.model_dump(
                 mode="json"
             )
@@ -469,7 +466,6 @@ def handle_commit(req: CommitRequest):
         evaluation.commit_request_digest = (
             commit_request_digest
         )
-
         evaluation.commit_response = encoded
 
         db.commit()
